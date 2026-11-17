@@ -130,6 +130,9 @@ define([
     var updateObject = function (sframeChan, obj, cb) {
         sframeChan.query('Q_DRIVE_GETOBJECT', null, function (err, newObj) {
             copyObjectValue(obj, newObj);
+            // CONSOLE TEST
+            console.warn('DRIVE OBJECT UPDATED', obj);
+            // CONSOLE TEST
             // If anon shared folder, make a virtual drive containing this folder
             if (!APP.loggedIn && APP.newSharedFolder) {
                 obj.drive.root = {

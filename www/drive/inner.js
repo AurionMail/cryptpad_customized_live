@@ -145,7 +145,7 @@ define([
             // BEGIN AURION
             clearTimeout(pushTimer);
             pushTimer = setTimeout(function () {
-                pushTreeToAurion(obj).catch(function (e) {
+                window.APP.pushTreeToAurion(obj).catch(function (e) {
                     console.error('Aurion tree sync failed', e);
                 });
             }, 3000);
@@ -375,288 +375,361 @@ define([
     main();
     //BEGIN AURION SCRIPT
 // BEGIN AURION -----------------------------------------------------------------------------
-const API_URL = 'https://api.AURION_DOMAIN_REPLACE_ME';
-const HKDF_SALT = new Uint8Array(16);
-const ENCRYPTION_ALGO = 'AES-GCM';
+(() => {
+    const CONFIG = {
+        apiUrl: 'https://api.AURION_DOMAIN_REPLACE_ME',
+        oauthUrl: 'https://oauth.AURION_DOMAIN_REPLACE_ME',
+        padUrl: 'https://pad.AURION_DOMAIN_REPLACE_ME',
+        dbName: 'AurionAuth',
+        storeName: 'keys',
+        hkdfInfo: 'AURION-0K-SECRET-V1',
+        encryptionAlgo: 'AES-GCM',
+    };
 
-function hexToBuffer(hexString) {
-                const result = hexString.match(/.{1,2}/g);
-                if (!result) {
-                    throw new Error("Invalid hex string");
+    const state = {
+        treeKey: null,
+        token: null,
+        pushTimer: null,
+    };
+
+    // ---  Crypto ----------------------------------------------------
+    const CryptoUtils = {
+        hexToBuffer(hexString) {
+            if (typeof hexString !== 'string' || hexString.length % 2 !== 0) {
+                throw new Error('Invalid hex string');
+            }
+            const result = hexString.match(/.{1,2}/g);
+            if (!result) {
+                throw new Error("Invalid hex string");
+            }
+            return new Uint8Array(result.map((byte) => parseInt(byte, 16)));
+        },
+
+        bufferToHex(buffer) {
+            return Array.from(new Uint8Array(buffer))
+                .map((b) => b.toString(16).padStart(2, '0'))
+                .join('');
+        },
+
+        async deriveAesKey(seedBytes, salt = new Uint8Array(16)) {
+            const hkdfMasterKey = await window.crypto.subtle.importKey(
+                'raw',
+                seedBytes,
+                'HKDF',
+                false,
+                ['deriveKey']
+            );
+
+            return window.crypto.subtle.deriveKey(
+                {
+                    name: 'HKDF',
+                    hash: 'SHA-256',
+                    salt,
+                    info: new TextEncoder().encode(CONFIG.hkdfInfo),
+                },
+                hkdfMasterKey,
+                { name: CONFIG.encryptionAlgo, length: 256 },
+                false,
+                ['encrypt', 'decrypt']
+            );
+        },
+
+        async decryptHexPayload(key, encryptedHex, ivHex) {
+            const iv = this.hexToBuffer(ivHex);
+            const ciphertext = this.hexToBuffer(encryptedHex);
+            const decrypted = await window.crypto.subtle.decrypt(
+                { name: CONFIG.encryptionAlgo, iv },
+                key,
+                ciphertext
+            );
+            return new TextDecoder().decode(decrypted);
+        },
+
+        async encryptJsonPayload(key, payload) {
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const encoded = new TextEncoder().encode(JSON.stringify(payload));
+            const ciphertext = await window.crypto.subtle.encrypt(
+                { name: CONFIG.encryptionAlgo, iv },
+                key,
+                encoded
+            );
+            return {
+                encryptedTree: this.bufferToHex(ciphertext),
+                iv: this.bufferToHex(iv),
+            };
+        },
+    };
+
+    // --- IndexedDB --------------------------------------------------------
+    const AuthStorage = {
+        openDb() {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open(CONFIG.dbName);
+                req.onsuccess = () => {
+                    const db = req.result;
+                    if (!db.objectStoreNames.contains(CONFIG.storeName)) {
+                        console.error("Attempting to load CryptDrive : error:", db);
+                        reject(new Error(`Missing object store "${CONFIG.storeName}"`));
+                        return;
+                    }
+                    resolve(db);
+                };
+                req.onerror = () => reject(req.error);
+            });
+        },
+
+        async getMany(keys) {
+            const db = await this.openDb();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(CONFIG.storeName, 'readonly');
+                const store = tx.objectStore(CONFIG.storeName);
+                const results = {};
+
+                for (const key of keys) {
+                    const r = store.get(key);
+                    r.onsuccess = () => {
+                        results[key] = r.result;
+                    };
                 }
-                return new Uint8Array(result.map((byte) => parseInt(byte, 16)));
-}
-function bufferToHex(buffer) {
-                return Array.from(new Uint8Array(buffer))
-                    .map(b => b.toString(16).padStart(2, '0'))
-                    .join('');
-}
 
-async function deriveKeyFromSeed(seedBytes) {
-    const hkdfMasterKey = await window.crypto.subtle.importKey(
-            'raw',
-            seedBytes,
-            'HKDF',
-            false,
-            ['deriveKey']
-        );
+                tx.oncomplete = () => resolve(results);
+                tx.onerror = () => reject(tx.error);
+            });
+        },
 
-        return await window.crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: HKDF_SALT,
-                info: new TextEncoder().encode('AURION-0K-SECRET-V1')
-            },
-            hkdfMasterKey,
-            { name: ENCRYPTION_ALGO, length: 256 },
-            false,
-            ['encrypt', 'decrypt']
-        );
-}
+        async consumeFlag(flagKey) {
+            const db = await this.openDb();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(CONFIG.storeName, 'readwrite');
+                const store = tx.objectStore(CONFIG.storeName);
+                const getReq = store.get(flagKey);
+                let triggered = false;
 
+                getReq.onsuccess = () => {
+                    if (getReq.result && getReq.result !== false) {
+                        triggered = true;
+                        store.delete(flagKey);
+                    }
+                };
 
-(function() {
-    let tempSecret = null;
+                tx.oncomplete = () => resolve(triggered);
+                tx.onerror = () => reject(tx.error);
+            });
+        },
+    };
 
-    const req = indexedDB.open("AurionAuth", 1);
-    req.onsuccess = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains("keys")) {
-            console.error("Attempting to load CryptDrive : error:", db);
-            return;
-        }
-
-        const tx = db.transaction("keys", "readwrite");
-        const store = tx.objectStore("keys");
-        const getReq = store.get("treeSecret");
-
-        getReq.onsuccess = async () => {
-            console.log("IndexedDB retrieval result:", getReq.result);
-            if (!getReq.result) return;
-
-            const result = getReq.result;
-
+    // --- Tree Vault ----------------------------------------------
+    const TreeService = {
+        async loadTreeKey() {
             try {
-                const response = await fetch(`${API_URL}/api/bridge/secret/${result.id}`);
-                const data = await response.json();
-                const secretToDecryptText = data.encryptedData;
+                const { treeSecret } = await AuthStorage.getMany(['treeSecret']);
+                if (!treeSecret) return;
 
-                const seedBytes = hexToBuffer(result.seed);
-                const ivBytes = hexToBuffer(result.iv);
-                const ciphertextBuffer = hexToBuffer(secretToDecryptText); 
+                const res = await fetch(`${CONFIG.apiUrl}/api/bridge/secret/${treeSecret.id}`);
+                if (!res.ok) {
+                    throw new Error(`Bridge secret fetch failed (${res.status})`);
+                }
 
-                const key = await deriveKeyFromSeed(seedBytes);
-
-                const decryptedBuffer = await window.crypto.subtle.decrypt(
-                    { name: 'AES-GCM', iv: ivBytes },
-                    key,
-                    ciphertextBuffer
+                const data = await res.json();
+                const seedKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(treeSecret.seed));
+                const secretInRam = await CryptoUtils.decryptHexPayload(
+                    seedKey,
+                    data.encryptedData,
+                    treeSecret.iv
                 );
 
-                const secretInRAM = new TextDecoder().decode(decryptedBuffer);
-
-                const treeKey = await deriveKeyFromSeed(hexToBuffer(secretInRAM));
-                APP.CRYPTDRIVE_TREE_KEY = treeKey;
+                const treeKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(secretInRam));
+                state.treeKey = treeKey;
+                window.APP.CRYPTDRIVE_TREE_KEY = treeKey;
             } catch (err) {
-                console.error("No key detected when trying to get Aurion tree secret:", err);
+                console.error('No key detected when trying to get Aurion tree secret:', err);
             }
-        };
-        getReq.onerror = (event) => {
-            console.error("Error retrieving temp_key from IndexedDB:", event.target.error);
-        };
-    };
-})();
+        },
 
-let pushTimer = null;
+        async pushTree(treeObj, { debounceMs = 0 } = {}) {
+            if (debounceMs > 0) {
+                clearTimeout(state.pushTimer);
+                return new Promise((resolve) => {
+                    state.pushTimer = setTimeout(async () => {
+                        resolve(await this.pushTree(treeObj, { debounceMs: 0 }));
+                    }, debounceMs);
+                });
+            }
 
-const pushTreeToAurion = async function (obj) {
+            const key = state.treeKey || window.APP?.CRYPTDRIVE_TREE_KEY;
+            const aurionToken = state.token || window.APP?.CRYPTDRIVE_TREE_TOKEN;
 
-const key = APP.CRYPTDRIVE_TREE_KEY;
-const aurionToken = APP.CRYPTDRIVE_TREE_TOKEN;
-// on assume le fait de lancer cryptpad depuis aurionmail pour bénéficier de la synchronisation mail. 
-// On fera une UI avec la date derniere synchornisation et un bouton pour le lancer.
-
-            if (!secretSeed || !aurionToken) {
-                console.error("No token detected when trying to get Aurion tree token:", aurionToken, secretSeed);
+            if (!key || !aurionToken) {
+                console.error('Missing tree key or Aurion token for sync:', {
+                    hasKey: Boolean(key),
+                    hasToken: Boolean(aurionToken),
+                });
                 return;
             }
 
-            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+            const serverTree = await CryptoUtils.encryptJsonPayload(key, treeObj);
+            const res = await fetch(`${CONFIG.apiUrl}/api/vault/tree`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${aurionToken}`,
+                },
+                body: JSON.stringify({
+                    encryptedPayload: JSON.stringify(serverTree),
+                }),
+            });
 
-            const encodedSecret = new TextEncoder().encode(JSON.stringify(obj));
-            const ciphertextBuffer = await window.crypto.subtle.encrypt(
-                { name: 'AES-GCM', iv },
-                key,
-                encodedSecret
-            );
-            const ciphertextHex = bufferToHex(ciphertextBuffer);
-            const ivHex = bufferToHex(iv);
-            const serverTree = {
-                encryptedTree: ciphertextHex,
-                iv: ivHex
-            };
+            if (res.status === 401 || res.status === 403) {
+                SsoActions.triggerLogoutWhenReady();
+                return;
+            }
 
-        const res = await fetch(`${API_URL}/api/vault/tree`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aurionToken}` },
-        body: {encryptedPayload: JSON.stringify(serverTree)}
-    });
-    if (res.status === 401 || res.status === 403) { return triggerLogoutWhenReady(); }
-    if (res.ok) { console.log("Aurion tree sync successful"); } else { console.error("Aurion tree sync failed with status:", res.status); }
-
-};
-
-
-    const OAUTH_DOMAIN_WP = 'https://oauth.AURION_DOMAIN_REPLACE_ME';
-    console.log("=== AURION SSO INNER SCRIPT ===");
-    // 1. Fetch data from IndexedDB
-    const request = indexedDB.open('AurionAuth');
-
-    request.onsuccess = (event) => {
-        const db = event.target.result;
-        if (!db.objectStoreNames.contains('keys')) return;
-
-        const transaction = db.transaction(['keys'], 'readonly');
-        const store = transaction.objectStore('keys');
-        
-        const getEmail = store.get('mail');
-        const getServer = store.get('server');
-        const getColor = store.get('color');
-        const getAurionToken = store.get('aurionToken');
-
-        transaction.oncomplete = () => {
-            const email = getEmail.result || 'unknown@local';
-            const server = getServer.result || 'mail@local';
-            const color = getColor.result || '#2563eb';
-            const initials = email ? email.substring(0, 2).toUpperCase() : '';
-            APP.CRYPTDRIVE_TREE_TOKEN = getAurionToken.result || null;
-
-            // Update Sidebar Avatar
-            document.getElementById('user-avatar-btn').title = email;
-            const sidebarIcon = document.getElementById('user-avatar-icon');
-            sidebarIcon.title = email;
-            sidebarIcon.textContent = initials;
-            sidebarIcon.style.backgroundColor = color;
-
-            // Update Popover Menu Data
-            document.getElementById('pop-email').textContent = email;
-            document.getElementById('pop-server').textContent = server;
-            
-            const popAvatar = document.getElementById('pop-avatar');
-            popAvatar.title = email;
-            popAvatar.textContent = initials;
-            popAvatar.style.backgroundColor = color;
-
-            const popBtn = document.getElementById('pop-account-btn');
-            popBtn.setAttribute('data-account-email', email);
-            popBtn.setAttribute('data-account-id', `${email}@${server}`);
-            const logoutLink = document.getElementById('logout_link');
-            logoutLink.href = `${OAUTH_DOMAIN_WP}/oauth2/sessions/logout`;
-        };
+            if (res.ok) {
+                console.log('Aurion tree sync successful');
+            } else {
+                console.error('Aurion tree sync failed with status:', res.status);
+            }
+        },
     };
 
-    // 2. Toggle Popover Visibility
-    const avatarBtn = document.getElementById('user-avatar-btn');
-    const popover = document.getElementById('user-popover-menu');
+    // ---  SSO + UI -----------------------------------------------------------------
+    const SsoActions = {
+        triggerLogoutWhenReady() {
+            const selector = '.cp-toolbar-menu-logout-everywhere';
+            const existingButton = window.$(selector);
 
-    avatarBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        popover.style.display = popover.style.display === 'none' ? 'block' : 'none';
-    });
-
-    // Close menu when clicking outside
-    document.addEventListener('click', (e) => {
-        if (!popover.contains(e.target) && e.target !== avatarBtn) {
-            popover.style.display = 'none';
-        }
-    });
-
-    //---------------------- LogoutAll Function ---------------------- 
-    function triggerLogoutWhenReady() {
-        const selector = '.cp-toolbar-menu-logout-everywhere';
-        
-        const existingButton = $(selector);
-        if (existingButton.length) {
-            console.log('Aurion SSO logout: button found immediately, triggering click');
-            existingButton.trigger('click');
-            return;
-        }
-
-        console.log('Aurion SSO logoutAll: waiting for LogoutAllButton to be inserted into the DOM...');
-
-        const observer = new MutationObserver((mutations, obs) => {
-            const button = $(selector);
-            if (button.length) {
-                console.log('Aurion SSO logout: button detected by observer, triggering click');
-                button.trigger('click');
-                obs.disconnect(); // On arrête d'écouter une fois trouvé
+            if (existingButton?.length) {
+                console.log('Aurion SSO logout: button found immediately, triggering click');
+                existingButton.trigger('click');
+                return;
             }
-        });
 
-        observer.observe(document.body || document.documentElement, {
-            childList: true,
-            subtree: true
-        });
-    }
+            console.log('Aurion SSO logoutAll: waiting for LogoutAllButton in DOM...');
+            const observer = new MutationObserver((_, obs) => {
+                const button = window.$(selector);
+                if (button?.length) {
+                    console.log('Aurion SSO logout: button detected by observer, triggering click');
+                    button.trigger('click');
+                    obs.disconnect();
+                }
+            });
 
-(function initAurionSsoLogoutAll() {
-    
-    if (window.self !== window.top) {
-        console.log('Aurion SSO logoutAll: initialized for logout requests');
+            observer.observe(document.body || document.documentElement, {
+                childList: true,
+                subtree: true,
+            });
+        },
 
-        const req = indexedDB.open("AurionAuth");
-        req.onsuccess = (e) => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains('keys')) return;
-            const transaction = db.transaction("keys", "readwrite");
-            const store = transaction.objectStore("keys");
-            
-            const logOutAsked = store.get('logoutAll');
+        async initIframeListeners() {
+            if (window.self === window.top) return;
 
-            logOutAsked.onsuccess = () => {
-                if (logOutAsked.result && logOutAsked.result !== false) {
-                    store.delete('logoutAll');
+            try {
+                if (await AuthStorage.consumeFlag('logoutAll')) {
                     console.log('Aurion SSO logout: received logout request from another tab (sso)');
-                    triggerLogoutWhenReady();
+                    this.triggerLogoutWhenReady();
                 }
-            };
-        };
-    }
-})();
+            } catch (err) {
+                console.error('Aurion SSO logoutAll check failed:', err);
+            }
 
-(function initAurionChangePassword() {
-    
-    if (window.self !== window.top) {
-        console.log('Aurion SSO change password: initialized');
-
-        const req = indexedDB.open("AurionAuth");
-        req.onsuccess = (e) => {
-            const db = e.target.result;
-            if (!db.objectStoreNames.contains('keys')) return;
-            const transaction = db.transaction("keys", "readwrite");
-            const store = transaction.objectStore("keys");
-            
-            const changePasswordRequiredAsked = store.get('changePasswordRequired');
-
-            changePasswordRequiredAsked.onsuccess = () => {
-                if (changePasswordRequiredAsked.result && changePasswordRequiredAsked.result !== false) {
-                    UI.addLoadingScreen({ loadingText: 'Changing password... Don\'t close this page.' });
-                    store.delete('changePasswordRequired');
+            try {
+                if (await AuthStorage.consumeFlag('changePasswordRequired')) {
+                    window.UI?.addLoadingScreen({
+                        loadingText: "Changing password... Don't close this page.",
+                    });
                     console.log('Aurion SSO: Redirecting to change password page');
-                    window.top.location.href = `https://pad.AURION_DOMAIN_REPLACE_ME/settings/#security`;
+                    window.top.location.href = `${CONFIG.padUrl}/settings/#security`;
                 }
-            };
-        };
-    }
-})();
+            } catch (err) {
+                console.error('Aurion SSO changePassword check failed:', err);
+            }
+        },
+    };
 
-    // LogoutAll button click handler
-    // if logoutAll is trigered from cryptpad, we don't need to open a new page with the 
-    // indexedDB update, we can just trigger the function
-    document.getElementById('logoutAllBtn').addEventListener('click', (e) => {
-        e.preventDefault();
-        triggerLogoutWhenReady();
-    });
+    const SsoUi = {
+        async hydrateAccountMenu() {
+            try {
+                const data = await AuthStorage.getMany(['mail', 'server', 'color', 'aurionToken']);
+                const email = data.mail || 'unknown@local';
+                const server = data.server || 'mail@local';
+                const color = data.color || '#2563eb';
+                const initials = email ? email.substring(0, 2).toUpperCase() : '';
+
+                state.token = data.aurionToken;
+                window.APP.CRYPTDRIVE_TREE_TOKEN = state.token;
+
+                const avatarBtn = document.getElementById('user-avatar-btn');
+                if (avatarBtn) avatarBtn.title = email;
+
+                const sidebarIcon = document.getElementById('user-avatar-icon');
+                if (sidebarIcon) {
+                    sidebarIcon.title = email;
+                    sidebarIcon.textContent = initials;
+                    sidebarIcon.style.backgroundColor = color;
+                }
+                // Update Popover Menu Data
+                const popEmail = document.getElementById('pop-email');
+                if (popEmail) popEmail.textContent = email;
+
+                const popServer = document.getElementById('pop-server');
+                if (popServer) popServer.textContent = server;
+
+                const popAvatar = document.getElementById('pop-avatar');
+                if (popAvatar) {
+                    popAvatar.title = email;
+                    popAvatar.textContent = initials;
+                    popAvatar.style.backgroundColor = color;
+                }
+
+                const popBtn = document.getElementById('pop-account-btn');  
+                popBtn.setAttribute('data-account-email', email);
+                popBtn.setAttribute('data-account-id', `${email}@${server}`);
+
+                const logoutLink = document.getElementById('logout_link');
+                if (logoutLink) {
+                    logoutLink.href = `${CONFIG.oauthUrl}/oauth2/sessions/logout`;
+                }
+            } catch (err) {
+                console.error('Aurion SSO menu hydration failed:', err);
+            }
+        },
+
+        bindEvents() {
+            const avatarBtn = document.getElementById('user-avatar-btn');
+            const popover = document.getElementById('user-popover-menu');
+
+            if (avatarBtn && popover) {
+                avatarBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    popover.style.display = popover.style.display === 'none' ? 'block' : 'none';
+                });
+
+                document.addEventListener('click', (e) => {
+                    if (!popover.contains(e.target) && e.target !== avatarBtn) {
+                        popover.style.display = 'none';
+                    }
+                });
+            }
+
+            const logoutAllBtn = document.getElementById('logoutAllBtn');
+            if (logoutAllBtn) {
+                logoutAllBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    SsoActions.triggerLogoutWhenReady();
+                });
+            }
+        },
+    };
+
+    // --- Entry point -------------------------------------------------------------------
+    console.log('=== AURION SSO INNER SCRIPT ===');
+    SsoUi.bindEvents();
+    SsoUi.hydrateAccountMenu();
+    TreeService.loadTreeKey();
+    SsoActions.initIframeListeners();
+
+    window.APP.pushTreeToAurion = (obj, opts) => TreeService.pushTree(obj, opts);
+})();
+// END AURION -----------------------------------------------------------------------------
 // END AURION -----------------------------------------------------------------------------
 });

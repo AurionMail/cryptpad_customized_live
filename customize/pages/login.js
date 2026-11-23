@@ -14,6 +14,7 @@ define([
 
         const urlParams = new URLSearchParams(window.location.search);
         const WEBMAIL_ORIGIN_WP = 'https://web.AURION_DOMAIN_REPLACE_ME';
+        // BEGIN AURION
         if (urlParams.get('from') !== 'aurion') {
             window.location.replace(WEBMAIL_ORIGIN_WP);
             // wait 1s before returning to be sure the redirect has time to happen
@@ -22,6 +23,7 @@ define([
             }, 1000);
         }
 
+        // END AURION
         document.title = Msg.login_login;
 
         const ssoLength = Config?.sso?.list?.length;

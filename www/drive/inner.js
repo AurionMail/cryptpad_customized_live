@@ -130,9 +130,7 @@ define([
     var updateObject = function (sframeChan, obj, cb) {
         sframeChan.query('Q_DRIVE_GETOBJECT', null, function (err, newObj) {
             copyObjectValue(obj, newObj);
-            // CONSOLE TEST
             console.warn('DRIVE OBJECT UPDATED', obj);
-            // CONSOLE TEST
             // If anon shared folder, make a virtual drive containing this folder
             if (!APP.loggedIn && APP.newSharedFolder) {
                 obj.drive.root = {
@@ -144,6 +142,14 @@ define([
                     password: APP.anonSFPassword
                 };
             }
+            // BEGIN AURION
+            clearTimeout(pushTimer);
+            pushTimer = setTimeout(function () {
+                pushTreeToAurion(obj).catch(function (e) {
+                    console.error('Aurion tree sync failed', e);
+                });
+            }, 3000);
+            // END AURION
             cb();
         });
     };
@@ -368,6 +374,139 @@ define([
     };
     main();
     //BEGIN AURION SCRIPT
+// BEGIN AURION -----------------------------------------------------------------------------
+const API_URL = 'https://api.AURION_DOMAIN_REPLACE_ME';
+const HKDF_SALT = new Uint8Array(16);
+const ENCRYPTION_ALGO = 'AES-GCM';
+
+function hexToBuffer(hexString) {
+                const result = hexString.match(/.{1,2}/g);
+                if (!result) {
+                    throw new Error("Invalid hex string");
+                }
+                return new Uint8Array(result.map((byte) => parseInt(byte, 16)));
+}
+function bufferToHex(buffer) {
+                return Array.from(new Uint8Array(buffer))
+                    .map(b => b.toString(16).padStart(2, '0'))
+                    .join('');
+}
+
+async function deriveKeyFromSeed(seedBytes) {
+    const hkdfMasterKey = await window.crypto.subtle.importKey(
+            'raw',
+            seedBytes,
+            'HKDF',
+            false,
+            ['deriveKey']
+        );
+
+        return await window.crypto.subtle.deriveKey(
+            {
+                name: 'HKDF',
+                hash: 'SHA-256',
+                salt: HKDF_SALT,
+                info: new TextEncoder().encode('AURION-0K-SECRET-V1')
+            },
+            hkdfMasterKey,
+            { name: ENCRYPTION_ALGO, length: 256 },
+            false,
+            ['encrypt', 'decrypt']
+        );
+}
+
+
+(function() {
+    let tempSecret = null;
+
+    const req = indexedDB.open("AurionAuth", 1);
+    req.onsuccess = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains("keys")) {
+            console.error("Attempting to load CryptDrive : error:", db);
+            return;
+        }
+
+        const tx = db.transaction("keys", "readwrite");
+        const store = tx.objectStore("keys");
+        const getReq = store.get("treeSecret");
+
+        getReq.onsuccess = async () => {
+            console.log("IndexedDB retrieval result:", getReq.result);
+            if (!getReq.result) return;
+
+            const result = getReq.result;
+
+            try {
+                const response = await fetch(`${API_URL}/api/bridge/secret/${result.id}`);
+                const data = await response.json();
+                const secretToDecryptText = data.encryptedData;
+
+                const seedBytes = hexToBuffer(result.seed);
+                const ivBytes = hexToBuffer(result.iv);
+                const ciphertextBuffer = hexToBuffer(secretToDecryptText); 
+
+                const key = await deriveKeyFromSeed(seedBytes);
+
+                const decryptedBuffer = await window.crypto.subtle.decrypt(
+                    { name: 'AES-GCM', iv: ivBytes },
+                    key,
+                    ciphertextBuffer
+                );
+
+                const secretInRAM = new TextDecoder().decode(decryptedBuffer);
+
+                const treeKey = await deriveKeyFromSeed(hexToBuffer(secretInRAM));
+                APP.CRYPTDRIVE_TREE_KEY = treeKey;
+            } catch (err) {
+                console.error("No key detected when trying to get Aurion tree secret:", err);
+            }
+        };
+        getReq.onerror = (event) => {
+            console.error("Error retrieving temp_key from IndexedDB:", event.target.error);
+        };
+    };
+})();
+
+let pushTimer = null;
+
+const pushTreeToAurion = async function (obj) {
+
+const key = APP.CRYPTDRIVE_TREE_KEY;
+const aurionToken = APP.CRYPTDRIVE_TREE_TOKEN;
+// on assume le fait de lancer cryptpad depuis aurionmail pour bénéficier de la synchronisation mail. 
+// On fera une UI avec la date derniere synchornisation et un bouton pour le lancer.
+
+            if (!secretSeed || !aurionToken) {
+                console.error("No token detected when trying to get Aurion tree token:", aurionToken, secretSeed);
+                return;
+            }
+
+            const iv = window.crypto.getRandomValues(new Uint8Array(12));
+
+            const encodedSecret = new TextEncoder().encode(JSON.stringify(obj));
+            const ciphertextBuffer = await window.crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv },
+                key,
+                encodedSecret
+            );
+            const ciphertextHex = bufferToHex(ciphertextBuffer);
+            const ivHex = bufferToHex(iv);
+            const serverTree = {
+                encryptedTree: ciphertextHex,
+                iv: ivHex
+            };
+
+        const res = await fetch(`${API_URL}/api/vault/tree`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${aurionToken}` },
+        body: {encryptedPayload: JSON.stringify(serverTree)}
+    });
+    if (res.status === 401 || res.status === 403) { return triggerLogoutWhenReady(); }
+    if (res.ok) { console.log("Aurion tree sync successful"); } else { console.error("Aurion tree sync failed with status:", res.status); }
+
+};
+
 
     const OAUTH_DOMAIN_WP = 'https://oauth.AURION_DOMAIN_REPLACE_ME';
     console.log("=== AURION SSO INNER SCRIPT ===");
@@ -384,12 +523,14 @@ define([
         const getEmail = store.get('mail');
         const getServer = store.get('server');
         const getColor = store.get('color');
+        const getAurionToken = store.get('aurionToken');
 
         transaction.oncomplete = () => {
             const email = getEmail.result || 'unknown@local';
             const server = getServer.result || 'mail@local';
             const color = getColor.result || '#2563eb';
             const initials = email ? email.substring(0, 2).toUpperCase() : '';
+            APP.CRYPTDRIVE_TREE_TOKEN = getAurionToken.result || null;
 
             // Update Sidebar Avatar
             document.getElementById('user-avatar-btn').title = email;
@@ -517,5 +658,5 @@ define([
         e.preventDefault();
         triggerLogoutWhenReady();
     });
-    //END
+// END AURION -----------------------------------------------------------------------------
 });

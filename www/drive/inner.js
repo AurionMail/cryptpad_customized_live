@@ -143,12 +143,9 @@ define([
                 };
             }
             // BEGIN AURION
-            clearTimeout(pushTimer);
-            pushTimer = setTimeout(function () {
-                window.APP.pushTreeToAurion(obj).catch(function (e) {
+                APP.pushTreeToAurion(obj).catch(function (e) {
                     console.error('Aurion tree sync failed', e);
                 });
-            }, 3000);
             // END AURION
             cb();
         });
@@ -540,7 +537,7 @@ define([
 
                 const treeKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(secretInRam));
                 state.treeKey = treeKey;
-                window.APP.CRYPTDRIVE_TREE_KEY = treeKey;
+                APP.CRYPTDRIVE_TREE_KEY = treeKey;
             } catch (err) {
                 console.error('No key detected when trying to get Aurion tree secret:', err);
             }
@@ -556,8 +553,8 @@ define([
                 });
             }
 
-            const key = state.treeKey || window.APP?.CRYPTDRIVE_TREE_KEY;
-            const aurionToken = state.token || window.APP?.CRYPTDRIVE_TREE_TOKEN;
+            const key = state.treeKey || APP.CRYPTDRIVE_TREE_KEY;
+            const aurionToken = state.token || APP.CRYPTDRIVE_TREE_TOKEN;
 
             if (!key || !aurionToken) {
                 console.error('Missing tree key or Aurion token for sync:', {
@@ -656,7 +653,7 @@ define([
                 const initials = email ? email.substring(0, 2).toUpperCase() : '';
 
                 state.token = data.aurionToken;
-                window.APP.CRYPTDRIVE_TREE_TOKEN = state.token;
+                APP.CRYPTDRIVE_TREE_TOKEN = state.token;
 
                 const avatarBtn = document.getElementById('user-avatar-btn');
                 if (avatarBtn) avatarBtn.title = email;
@@ -728,7 +725,7 @@ define([
     TreeService.loadTreeKey();
     SsoActions.initIframeListeners();
 
-    window.APP.pushTreeToAurion = (obj, opts) => TreeService.pushTree(obj, opts);
+    APP.pushTreeToAurion = (obj, opts) => TreeService.pushTree(obj, opts);
 })();
 // END AURION -----------------------------------------------------------------------------
 // END AURION -----------------------------------------------------------------------------

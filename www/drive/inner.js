@@ -389,6 +389,7 @@ define([
         treeKey: null,
         token: null,
         pushTimer: null,
+        loadKeyPromise: null,
     };
 
     // ---  Crypto ----------------------------------------------------
@@ -556,6 +557,21 @@ define([
             return CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(secretInRam));
         },
 
+        async ensureTreeKey() {
+            if (state.treeKey || APP.CRYPTDRIVE_TREE_KEY) {
+                if (!state.treeKey) state.treeKey = APP.CRYPTDRIVE_TREE_KEY;
+                if (!APP.CRYPTDRIVE_TREE_KEY) APP.CRYPTDRIVE_TREE_KEY = state.treeKey;
+                return state.treeKey;
+            }
+
+            if (!state.loadKeyPromise) {
+                state.loadKeyPromise = this.loadTreeKey();
+            }
+
+            await state.loadKeyPromise;
+            return state.treeKey || APP.CRYPTDRIVE_TREE_KEY || null;
+        },
+
         async loadTreeKey() {
             let dangerousStorageEnabled = false;
             let cachedTreeKey = null;
@@ -605,6 +621,8 @@ define([
                     }, debounceMs);
                 });
             }
+
+            await this.ensureTreeKey();
 
             const key = state.treeKey || APP.CRYPTDRIVE_TREE_KEY;
             const aurionToken = state.token || APP.CRYPTDRIVE_TREE_TOKEN;
@@ -731,9 +749,11 @@ define([
                     popAvatar.style.backgroundColor = color;
                 }
 
-                const popBtn = document.getElementById('pop-account-btn');  
-                popBtn.setAttribute('data-account-email', email);
-                popBtn.setAttribute('data-account-id', `${email}@${server}`);
+                const popBtn = document.getElementById('pop-account-btn');
+                if (popBtn) {
+                    popBtn.setAttribute('data-account-email', email);
+                    popBtn.setAttribute('data-account-id', `${email}@${server}`);
+                }
 
                 const logoutLink = document.getElementById('logout_link');
                 if (logoutLink) {
@@ -775,7 +795,6 @@ define([
     console.log('=== AURION SSO INNER SCRIPT ===');
     SsoUi.bindEvents();
     SsoUi.hydrateAccountMenu();
-    TreeService.loadTreeKey();
     SsoActions.initIframeListeners();
 
     APP.pushTreeToAurion = (obj, opts) => TreeService.pushTree(obj, opts);

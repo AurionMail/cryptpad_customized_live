@@ -381,6 +381,8 @@ define([
         storeName: 'keys',
         hkdfInfo: 'AURION-0K-SECRET-V1',
         encryptionAlgo: 'AES-GCM',
+        cachedTreeKeyStorageKey: 'cachedTreeKey',
+        dangerousStorageFlagKey: 'dangerousTreeSecretStorage',
     };
 
     const state = {
@@ -494,6 +496,21 @@ define([
             });
         },
 
+        async setMany(entries) {
+            const db = await this.openDb();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(CONFIG.storeName, 'readwrite');
+                const store = tx.objectStore(CONFIG.storeName);
+
+                for (const [key, value] of Object.entries(entries)) {
+                    store.put(value, key);
+                }
+
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        },
+
         async consumeFlag(flagKey) {
             const db = await this.openDb();
             return new Promise((resolve, reject) => {
@@ -517,29 +534,65 @@ define([
 
     // --- Tree Vault ----------------------------------------------
     const TreeService = {
-        async loadTreeKey() {
-            try {
-                const { treeSecret } = await AuthStorage.getMany(['treeSecret']);
-                if (!treeSecret) return;
+        applyTreeKey(treeKey) {
+            state.treeKey = treeKey;
+            APP.CRYPTDRIVE_TREE_KEY = treeKey;
+        },
 
-                const res = await fetch(`${CONFIG.apiUrl}/api/bridge/secret/${treeSecret.id}`);
-                if (!res.ok) {
-                    throw new Error(`Bridge secret fetch failed (${res.status})`);
+        async deriveKeyFromTreeSecret(treeSecret) {
+            const res = await fetch(`${CONFIG.apiUrl}/api/bridge/secret/${treeSecret.id}`);
+            if (!res.ok) {
+                throw new Error(`Bridge secret fetch failed (${res.status})`);
+            }
+
+            const data = await res.json();
+            const seedKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(treeSecret.seed));
+            const secretInRam = await CryptoUtils.decryptHexPayload(
+                seedKey,
+                data.encryptedData,
+                treeSecret.iv
+            );
+
+            return CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(secretInRam));
+        },
+
+        async loadTreeKey() {
+            let dangerousStorageEnabled = false;
+            let cachedTreeKey = null;
+
+            try {
+                const stored = await AuthStorage.getMany([
+                    'treeSecret',
+                    CONFIG.dangerousStorageFlagKey,
+                    CONFIG.cachedTreeKeyStorageKey,
+                ]);
+                dangerousStorageEnabled = stored[CONFIG.dangerousStorageFlagKey] === true;
+                cachedTreeKey = stored[CONFIG.cachedTreeKeyStorageKey] || null;
+                const treeSecret = stored.treeSecret;
+
+                if (!treeSecret) {
+                    throw new Error('Missing treeSecret in IndexedDB');
                 }
 
-                const data = await res.json();
-                const seedKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(treeSecret.seed));
-                const secretInRam = await CryptoUtils.decryptHexPayload(
-                    seedKey,
-                    data.encryptedData,
-                    treeSecret.iv
-                );
+                const treeKey = await this.deriveKeyFromTreeSecret(treeSecret);
+                this.applyTreeKey(treeKey);
 
-                const treeKey = await CryptoUtils.deriveAesKey(CryptoUtils.hexToBuffer(secretInRam));
-                state.treeKey = treeKey;
-                APP.CRYPTDRIVE_TREE_KEY = treeKey;
+                if (dangerousStorageEnabled) {
+                    try {
+                        await AuthStorage.setMany({
+                            [CONFIG.cachedTreeKeyStorageKey]: treeKey,
+                        });
+                    } catch (cacheErr) {
+                        console.error('Failed to persist treeKey in IndexedDB:', cacheErr);
+                    }
+                }
             } catch (err) {
                 console.error('No key detected when trying to get Aurion tree secret:', err);
+
+                if (dangerousStorageEnabled && cachedTreeKey) {
+                    console.warn('Falling back to cached treeKey from IndexedDB (dangerousTreeSecretStorage enabled)');
+                    this.applyTreeKey(cachedTreeKey);
+                }
             }
         },
 
